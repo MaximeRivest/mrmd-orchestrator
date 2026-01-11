@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mrmd-orchestrator"
+version = "0.1.0"
+description = "Orchestrator for mrmd services - starts sync, monitors, and runtimes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Maxime" }
+]
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "httpx>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+mrmd-orchestrator = "mrmd_orchestrator.cli:main"
+mrmd = "mrmd_orchestrator.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mrmd_orchestrator"]
