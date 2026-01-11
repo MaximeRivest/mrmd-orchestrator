@@ -8,17 +8,17 @@ mrmd-monitor, so long-running code survives browser disconnects.
 JavaScript runs directly in the browser:
 
 ```javascript
-const items = ["apple", "banana", "cherry"];
-const data = { count: items.length, first: items[0] };
+const items = ["apple", "banandsa", "cherry"];
+const data = { count: items.length, first: items[1] };
 console.log("Items:", items.join(", "));
 data
 ```
 
-```output:exec-1768147541401-635yd
-Items: apple, banana, cherry
+```output:exec-1768172394592-5wugm
+Items: apple, banandsa, cherry
 {
   "count": 3,
-  "first": "apple"
+  "first": "banandsa"
 }
 ```
 
@@ -35,7 +35,7 @@ print(f"The answer is {x}")
 math.sqrt(x)
 ```
 
-```output:exec-1768147544455-2byu4
+```output:exec-1768173503911-q2nhc
 The answer is 42
 Out[1]: 6.48074069840786
 ```
@@ -133,9 +133,37 @@ for i in range(10):
 print("Done!")
 ```
 
+```output:exec-1768150557869-b8qyx
+Step 1/10...
+Step 2/10...
+Step 3/10...
+Step 4/10...
+Step 5/10...
+Step 6/10...
+Step 7/10...
+Step 8/10...
+Step 9/10...
+Step 10/10...
+Done!
+```
+
 ---
 
 **Monitor Mode**: Executions go through mrmd-monitor instead of directly to the runtime.
 This means long-running code survives browser disconnects.
 
 Press **Shift+Enter** to run a code cell, or click the **play button**.
+
+
+```python
+x
+```
+
+```output:exec-1768150567927-97qg3
+Out[3]: 42
+```
+
+```python
+
+```
+

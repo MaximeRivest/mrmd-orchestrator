@@ -2,10 +2,12 @@
 Main orchestrator for mrmd services.
 
 Coordinates starting/stopping of sync server, monitors, and runtimes.
+Supports per-document dedicated Python runtimes for true process isolation.
 """
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +15,43 @@ from .config import OrchestratorConfig
 from .processes import ProcessManager
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SessionInfo:
+    """Information about an active session (document + its resources)."""
+    doc: str
+    monitor_process: Optional[str] = None
+    runtime_process: Optional[str] = None
+    runtime_url: Optional[str] = None
+    runtime_port: Optional[int] = None
+    dedicated_runtime: bool = False
+
+
+class PortAllocator:
+    """Allocates ports for dedicated runtimes."""
+
+    def __init__(self, base_port: int = 8001, max_ports: int = 100):
+        self.base_port = base_port
+        self.max_ports = max_ports
+        self._allocated: set[int] = set()
+
+    def allocate(self) -> int:
+        """Allocate the next available port."""
+        for offset in range(self.max_ports):
+            port = self.base_port + offset
+            if port not in self._allocated:
+                self._allocated.add(port)
+                return port
+        raise RuntimeError(f"No available ports in range {self.base_port}-{self.base_port + self.max_ports}")
+
+    def release(self, port: int):
+        """Release a previously allocated port."""
+        self._allocated.discard(port)
+
+    def is_allocated(self, port: int) -> bool:
+        """Check if a port is allocated."""
+        return port in self._allocated
 
 
 class Orchestrator:
@@ -28,6 +67,8 @@ class Orchestrator:
         self.config = config or OrchestratorConfig.for_development()
         self.processes = ProcessManager()
         self._monitors: dict[str, str] = {}  # doc_name -> process_name
+        self._sessions: dict[str, SessionInfo] = {}  # doc_name -> SessionInfo
+        self._port_allocator = PortAllocator(base_port=8001)
         self._started = False
 
     async def start(self):
@@ -236,4 +277,148 @@ class Orchestrator:
                 for lang, cfg in self.config.runtimes.items()
             },
             "editor": f"http://localhost:{self.config.editor.port}" if self.config.editor.enabled else None,
+        }
+
+    # =========================================================================
+    # Session Management (per-document resources)
+    # =========================================================================
+
+    async def create_session(
+        self,
+        doc_name: str,
+        python: str = "shared",
+    ) -> SessionInfo:
+        """
+        Create a session for a document with optional dedicated runtime.
+
+        Args:
+            doc_name: Document name (Yjs room name)
+            python: "shared" to use the shared runtime, "dedicated" for isolated runtime
+
+        Returns:
+            SessionInfo with URLs and process info
+        """
+        # Check if session already exists
+        if doc_name in self._sessions:
+            session = self._sessions[doc_name]
+            # If requesting dedicated but have shared (or vice versa), recreate
+            if (python == "dedicated") != session.dedicated_runtime:
+                await self.destroy_session(doc_name)
+            else:
+                return session
+
+        session = SessionInfo(doc=doc_name)
+
+        # Start monitor for this document
+        if self.config.monitor.managed:
+            await self.start_monitor(doc_name)
+            session.monitor_process = self._monitors.get(doc_name)
+
+        # Handle Python runtime
+        if python == "dedicated":
+            # Start dedicated Python runtime on new port
+            port = self._port_allocator.allocate()
+            runtime_url = f"http://localhost:{port}/mrp/v1"
+
+            process_name = f"python:{doc_name}"
+            package_path = Path(self.config.runtimes.get("python", {}).package_path
+                              if self.config.runtimes.get("python")
+                              else self.config._find_packages_dir() + "/mrmd-python")
+
+            # Use the same package path as the shared runtime
+            python_config = self.config.runtimes.get("python")
+            if python_config and python_config.package_path:
+                package_path = Path(python_config.package_path)
+
+            if package_path.exists():
+                command = [
+                    "uv", "run", "python", "-m", "mrmd_python.cli",
+                    "--port", str(port),
+                ]
+
+                await self.processes.start(
+                    name=process_name,
+                    command=command,
+                    cwd=str(package_path),
+                    wait_for="Uvicorn running",
+                    timeout=15.0,
+                )
+
+                session.runtime_process = process_name
+                session.runtime_url = runtime_url
+                session.runtime_port = port
+                session.dedicated_runtime = True
+                logger.info(f"Started dedicated Python runtime for {doc_name} on port {port}")
+            else:
+                logger.error(f"mrmd-python not found at {package_path}")
+                self._port_allocator.release(port)
+        else:
+            # Use shared runtime
+            python_config = self.config.runtimes.get("python")
+            if python_config:
+                session.runtime_url = python_config.url
+                session.dedicated_runtime = False
+
+        self._sessions[doc_name] = session
+        logger.info(f"Created session for {doc_name} (dedicated={session.dedicated_runtime})")
+        return session
+
+    async def destroy_session(self, doc_name: str) -> bool:
+        """
+        Destroy a session and clean up its resources.
+
+        Args:
+            doc_name: Document name
+
+        Returns:
+            True if session was destroyed
+        """
+        session = self._sessions.get(doc_name)
+        if not session:
+            return True
+
+        # Stop dedicated runtime if any
+        if session.runtime_process:
+            await self.processes.stop(session.runtime_process)
+            if session.runtime_port:
+                self._port_allocator.release(session.runtime_port)
+            logger.info(f"Stopped dedicated runtime for {doc_name}")
+
+        # Stop monitor
+        if session.monitor_process:
+            await self.stop_monitor(doc_name)
+
+        del self._sessions[doc_name]
+        logger.info(f"Destroyed session for {doc_name}")
+        return True
+
+    def get_session(self, doc_name: str) -> Optional[SessionInfo]:
+        """Get session info for a document."""
+        return self._sessions.get(doc_name)
+
+    def get_sessions(self) -> dict[str, SessionInfo]:
+        """Get all active sessions."""
+        return dict(self._sessions)
+
+    def get_session_info(self, doc_name: str) -> Optional[dict]:
+        """Get session info as a dict for API responses."""
+        session = self._sessions.get(doc_name)
+        if not session:
+            return None
+
+        return {
+            "doc": session.doc,
+            "sync": self.config.sync.url,
+            "monitor": {
+                "status": "running" if self.is_monitor_running(doc_name) else "stopped",
+                "name": session.monitor_process,
+            },
+            "runtimes": {
+                "python": {
+                    "url": session.runtime_url,
+                    "dedicated": session.dedicated_runtime,
+                    "port": session.runtime_port,
+                    "process": session.runtime_process,
+                }
+            } if session.runtime_url else {},
         }

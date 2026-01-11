@@ -35,6 +35,20 @@ class MonitorResponse(BaseModel):
     message: str
 
 
+class SessionRequest(BaseModel):
+    """Request to create a session."""
+    doc: str
+    python: str = "shared"  # "shared" or "dedicated"
+
+
+class SessionResponse(BaseModel):
+    """Response for session operations."""
+    doc: str
+    sync: str
+    monitor: dict
+    runtimes: dict
+
+
 def create_app(orchestrator: Orchestrator) -> FastAPI:
     """Create FastAPI application with orchestrator endpoints."""
 
@@ -144,6 +158,146 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         """Get recent log output from a process."""
         output = orchestrator.processes.get_output(process_name, lines)
         return {"process": process_name, "lines": output}
+
+    # --- File Management ---
+
+    @app.get("/api/files")
+    async def list_files():
+        """List markdown files in the docs directory."""
+        docs_dir = Path(orchestrator.config.sync.docs_dir)
+        if not docs_dir.exists():
+            return {"files": []}
+
+        files = []
+        for f in sorted(docs_dir.glob("*.md")):
+            if f.is_file():
+                stat = f.stat()
+                files.append({
+                    "name": f.stem,  # filename without .md
+                    "path": f.name,  # filename with .md
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                })
+        return {"files": files}
+
+    @app.post("/api/files")
+    async def create_file(request: dict):
+        """Create a new markdown file."""
+        name = request.get("name", "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Name is required")
+
+        # Sanitize filename
+        safe_name = "".join(c for c in name if c.isalnum() or c in "-_").strip()
+        if not safe_name:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        docs_dir = Path(orchestrator.config.sync.docs_dir)
+        docs_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path = docs_dir / f"{safe_name}.md"
+        if file_path.exists():
+            raise HTTPException(status_code=409, detail=f"File '{safe_name}' already exists")
+
+        # Create with default content
+        content = request.get("content", f"# {name}\n\nStart writing...\n")
+        file_path.write_text(content)
+
+        return {"name": safe_name, "path": f"{safe_name}.md"}
+
+    @app.delete("/api/files/{name}")
+    async def delete_file(name: str):
+        """Delete a markdown file."""
+        docs_dir = Path(orchestrator.config.sync.docs_dir)
+        file_path = docs_dir / f"{name}.md"
+
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"File '{name}' not found")
+
+        # Also destroy session if exists
+        await orchestrator.destroy_session(name)
+
+        file_path.unlink()
+        return {"status": "deleted", "name": name}
+
+    # --- Session Management ---
+
+    @app.get("/api/sessions")
+    async def list_sessions():
+        """List all active sessions."""
+        sessions = orchestrator.get_sessions()
+        return {
+            "sessions": [
+                orchestrator.get_session_info(doc) for doc in sessions.keys()
+            ]
+        }
+
+    @app.post("/api/sessions")
+    async def create_session(request: SessionRequest):
+        """
+        Create a session for a document.
+
+        This starts a monitor and optionally a dedicated Python runtime.
+
+        Request body:
+            doc: Document name (Yjs room name)
+            python: "shared" (default) or "dedicated"
+
+        Returns session info with URLs for sync, monitor, and runtime.
+        """
+        doc = request.doc
+        python = request.python
+
+        if python not in ("shared", "dedicated"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid python option: {python}. Must be 'shared' or 'dedicated'"
+            )
+
+        try:
+            await orchestrator.create_session(doc, python=python)
+            info = orchestrator.get_session_info(doc)
+
+            if not info:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to create session for '{doc}'"
+                )
+
+            return info
+        except Exception as e:
+            logger.error(f"Failed to create session for {doc}: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=str(e)
+            )
+
+    @app.get("/api/sessions/{doc}")
+    async def get_session(doc: str):
+        """Get session info for a document."""
+        info = orchestrator.get_session_info(doc)
+        if not info:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No session for '{doc}'"
+            )
+        return info
+
+    @app.delete("/api/sessions/{doc}")
+    async def delete_session(doc: str):
+        """
+        Destroy a session and clean up its resources.
+
+        This stops the monitor and any dedicated runtime for the document.
+        """
+        success = await orchestrator.destroy_session(doc)
+        if success:
+            return {"doc": doc, "status": "destroyed"}
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to destroy session for '{doc}'"
+            )
 
     return app
 

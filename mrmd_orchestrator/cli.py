@@ -5,11 +5,13 @@ mrmd-orchestrator CLI
 Starts all mrmd services and provides HTTP API for management.
 
 Usage:
-    mrmd                           # Start with defaults
-    mrmd --docs ./notebooks        # Custom docs directory
-    mrmd --port 3000               # Custom HTTP port
-    mrmd --no-editor               # Don't serve editor
-    mrmd --sync-url ws://remote    # Connect to remote sync (don't start local)
+    mrmd                                     # Start with defaults
+    mrmd --docs ./notebooks                  # Custom docs directory
+    mrmd --port 3000                         # Custom HTTP port
+    mrmd --no-editor                         # Don't serve editor
+    mrmd --sync-url ws://remote              # Connect to remote sync (don't start local)
+    mrmd --session my-notebook               # Auto-start session (shared Python)
+    mrmd --session my-notebook:dedicated     # Auto-start session with dedicated Python runtime
 """
 
 import argparse
@@ -128,6 +130,16 @@ Monitors are started on-demand via the API:
         help="Auto-start monitor for document (can be repeated)",
     )
 
+    # Auto-start sessions (with optional dedicated runtime)
+    parser.add_argument(
+        "--session",
+        action="append",
+        dest="sessions",
+        metavar="DOC[:MODE]",
+        help="Auto-start session for document. MODE is 'shared' (default) or 'dedicated'. "
+             "Examples: --session notebook, --session notebook:dedicated (can be repeated)",
+    )
+
     # Misc
     parser.add_argument(
         "--log-level",
@@ -240,23 +252,54 @@ async def async_main(args):
         # Start orchestrator
         await orchestrator.start()
 
-        # Auto-start monitors if specified
+        # Auto-start monitors if specified (legacy flag, creates session with shared runtime)
         if args.monitors:
             for doc in args.monitors:
-                await orchestrator.start_monitor(doc)
+                await orchestrator.create_session(doc, python="shared")
+
+        # Auto-start sessions if specified
+        if args.sessions:
+            for session_spec in args.sessions:
+                # Parse doc:mode format
+                if ":" in session_spec:
+                    parts = session_spec.rsplit(":", 1)
+                    doc = parts[0]
+                    mode = parts[1].lower()
+                    if mode not in ("shared", "dedicated"):
+                        logger.warning(f"Invalid session mode '{mode}' for {doc}, using 'shared'")
+                        mode = "shared"
+                else:
+                    doc = session_spec
+                    mode = "shared"
+
+                await orchestrator.create_session(doc, python=mode)
+                logger.info(f"Started session for {doc} (python={mode})")
 
         # Print status
         urls = orchestrator.get_urls()
+        sessions = orchestrator.get_sessions()
         print()
         print("\033[36m  mrmd orchestrator\033[0m")
         print("  " + "─" * 40)
         print(f"  Editor:   http://localhost:{config.editor.port}")
         print(f"  Sync:     {urls['sync']}")
-        print(f"  Runtime:  {urls['runtimes'].get('python', 'not running')}")
+        print(f"  Runtime:  {urls['runtimes'].get('python', 'not running')} (shared)")
         print(f"  API:      http://localhost:{config.editor.port}/api/status")
+
+        # Show active sessions
+        if sessions:
+            print()
+            print("  \033[36mActive Sessions:\033[0m")
+            for doc, session in sessions.items():
+                runtime_info = "dedicated" if session.dedicated_runtime else "shared"
+                port_info = f" (port {session.runtime_port})" if session.runtime_port else ""
+                print(f"    {doc}: python={runtime_info}{port_info}")
+
         print()
-        print("  Monitors can be started via API:")
-        print(f"    curl -X POST http://localhost:{config.editor.port}/api/monitors -H 'Content-Type: application/json' -d '{{\"doc\": \"my-notebook\"}}'")
+        print("  Sessions can be started via API:")
+        print(f"    curl -X POST http://localhost:{config.editor.port}/api/sessions \\")
+        print(f"      -H 'Content-Type: application/json' \\")
+        print(f"      -d '{{\"doc\": \"my-notebook\", \"python\": \"dedicated\"}}'")
         print()
 
         # Run server (blocks until shutdown)
