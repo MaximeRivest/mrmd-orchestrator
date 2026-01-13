@@ -36,7 +36,7 @@ x = 6 +2
 x
 ```
 
-```output:exec-1768172293734-2uqs4
+```output:exec-1768310058375-0anaq
 Out[3]: 8
 ```
 
@@ -44,8 +44,8 @@ Out[3]: 8
 x
 ```
 
-```output:exec-1768172299706-k6vl1
-Out[4]: 8
+```output:exec-1768310053017-kpvc0
+Out[2]: 2
 ```
 
 ```python

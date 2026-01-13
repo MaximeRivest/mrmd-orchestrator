@@ -26,6 +26,7 @@ class SessionInfo:
     runtime_url: Optional[str] = None
     runtime_port: Optional[int] = None
     dedicated_runtime: bool = False
+    venv: Optional[str] = None  # Path to virtual environment
 
 
 class PortAllocator:
@@ -87,6 +88,10 @@ class Orchestrator:
             if runtime_config.managed:
                 await self._start_runtime(lang, runtime_config)
 
+        # Start AI server if managed
+        if self.config.ai.managed:
+            await self._start_ai()
+
         self._started = True
         logger.info("Orchestrator ready")
 
@@ -143,23 +148,81 @@ class Orchestrator:
             logger.warning(f"Unknown runtime language: {language}")
 
     async def _start_python_runtime(self, runtime_config):
-        """Start mrmd-python runtime."""
+        """Start mrmd-python runtime with default environment."""
+        await self._start_python_runtime_with_env(runtime_config)
+
+    async def _start_python_runtime_with_env(self, runtime_config, cwd: str = None):
+        """
+        Start the SHARED mrmd-python runtime.
+
+        NOTE: The shared runtime does NOT support custom venvs.
+        Custom venvs are only supported for dedicated sessions via create_session().
+
+        Args:
+            runtime_config: RuntimeConfig for Python
+            cwd: Working directory for the runtime
+        """
         package_path = Path(runtime_config.package_path)
 
         if not package_path.exists():
             logger.error(f"mrmd-python not found at {package_path}")
             return
 
-        # Use uv run to execute in the package's virtual environment
+        # Get cwd from environment settings if not provided
+        # NOTE: We intentionally do NOT use venv from _environment for the shared runtime
+        # because the user's venv doesn't have mrmd_python installed
+        env_config = getattr(self, '_environment', {})
+        cwd = cwd or env_config.get('cwd')
+
+        # Always use uv run for the shared runtime
         command = [
             "uv", "run", "python", "-m", "mrmd_python.cli",
             "--port", str(runtime_config.port),
         ]
+        env = None
+
+        # Determine working directory
+        if cwd:
+            work_dir = str(Path(cwd).expanduser().resolve())
+        else:
+            work_dir = str(package_path)
 
         await self.processes.start(
             name="mrmd-python",
             command=command,
+            cwd=work_dir,
+            env=env,
+            wait_for="Uvicorn running",
+            timeout=15.0,
+        )
+
+    async def _start_ai(self):
+        """Start mrmd-ai server."""
+        import os
+        config = self.config.ai
+        package_path = Path(config.package_path)
+
+        if not package_path.exists():
+            logger.error(f"mrmd-ai not found at {package_path}")
+            return
+
+        command = [
+            "uv", "run", "mrmd-ai-server",
+            "--host", "127.0.0.1",
+            "--port", str(config.port),
+        ]
+
+        # Pass through API keys from environment
+        env = {}
+        for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"]:
+            if value := os.environ.get(key):
+                env[key] = value
+
+        await self.processes.start(
+            name="mrmd-ai",
+            command=command,
             cwd=str(package_path),
+            env=env if env else None,
             wait_for="Uvicorn running",
             timeout=15.0,
         )
@@ -259,6 +322,12 @@ class Orchestrator:
                 }
                 for lang, cfg in self.config.runtimes.items()
             },
+            "ai": {
+                "managed": self.config.ai.managed,
+                "url": self.config.ai.url,
+                "running": self.processes.is_running("mrmd-ai"),
+                "default_juice_level": self.config.ai.default_juice_level,
+            },
             "monitors": {
                 doc: {
                     "running": self.is_monitor_running(doc),
@@ -276,6 +345,7 @@ class Orchestrator:
                 lang: cfg.url
                 for lang, cfg in self.config.runtimes.items()
             },
+            "ai": self.config.ai.url if self.config.ai.managed or self.config.ai.url else None,
             "editor": f"http://localhost:{self.config.editor.port}" if self.config.editor.enabled else None,
         }
 
@@ -287,6 +357,7 @@ class Orchestrator:
         self,
         doc_name: str,
         python: str = "shared",
+        venv: Optional[str] = None,
     ) -> SessionInfo:
         """
         Create a session for a document with optional dedicated runtime.
@@ -294,6 +365,7 @@ class Orchestrator:
         Args:
             doc_name: Document name (Yjs room name)
             python: "shared" to use the shared runtime, "dedicated" for isolated runtime
+            venv: Optional path to virtual environment for dedicated runtimes
 
         Returns:
             SessionInfo with URLs and process info
@@ -301,13 +373,13 @@ class Orchestrator:
         # Check if session already exists
         if doc_name in self._sessions:
             session = self._sessions[doc_name]
-            # If requesting dedicated but have shared (or vice versa), recreate
-            if (python == "dedicated") != session.dedicated_runtime:
+            # If requesting dedicated but have shared (or vice versa), or different venv, recreate
+            if (python == "dedicated") != session.dedicated_runtime or session.venv != venv:
                 await self.destroy_session(doc_name)
             else:
                 return session
 
-        session = SessionInfo(doc=doc_name)
+        session = SessionInfo(doc=doc_name, venv=venv)
 
         # Start monitor for this document
         if self.config.monitor.managed:
@@ -331,15 +403,52 @@ class Orchestrator:
                 package_path = Path(python_config.package_path)
 
             if package_path.exists():
-                command = [
-                    "uv", "run", "python", "-m", "mrmd_python.cli",
-                    "--port", str(port),
-                ]
+                # Build command based on whether we have a custom venv
+                if venv:
+                    venv_path = Path(venv).expanduser().resolve()
+
+                    import sys
+                    if sys.platform == 'win32':
+                        python_exe = str(venv_path / 'Scripts' / 'python.exe')
+                    else:
+                        python_exe = str(venv_path / 'bin' / 'python')
+
+                    # First, ensure mrmd-python dependencies are installed in the user's venv
+                    # This is done synchronously before starting the server
+                    import subprocess
+                    deps = ["ipython", "starlette", "uvicorn", "sse-starlette"]
+                    logger.info(f"Ensuring mrmd-python dependencies in venv: {venv_path}")
+                    try:
+                        subprocess.run(
+                            ["uv", "pip", "install", "--python", python_exe] + deps,
+                            check=True,
+                            capture_output=True,
+                            timeout=120,
+                        )
+                    except subprocess.CalledProcessError as e:
+                        logger.warning(f"Failed to install deps: {e.stderr.decode() if e.stderr else e}")
+                    except Exception as e:
+                        logger.warning(f"Failed to install deps: {e}")
+
+                    # Run mrmd-python directly with the user's venv Python
+                    # PYTHONPATH includes mrmd-python/src so the module is found
+                    command = [
+                        python_exe, "-m", "mrmd_python.cli",
+                        "--port", str(port),
+                    ]
+                    env = {"PYTHONPATH": str(package_path / "src")}
+                else:
+                    command = [
+                        "uv", "run", "python", "-m", "mrmd_python.cli",
+                        "--port", str(port),
+                    ]
+                    env = None
 
                 await self.processes.start(
                     name=process_name,
                     command=command,
                     cwd=str(package_path),
+                    env=env,
                     wait_for="Uvicorn running",
                     timeout=15.0,
                 )
@@ -348,7 +457,7 @@ class Orchestrator:
                 session.runtime_url = runtime_url
                 session.runtime_port = port
                 session.dedicated_runtime = True
-                logger.info(f"Started dedicated Python runtime for {doc_name} on port {port}")
+                logger.info(f"Started dedicated Python runtime for {doc_name} on port {port} (venv={venv})")
             else:
                 logger.error(f"mrmd-python not found at {package_path}")
                 self._port_allocator.release(port)
@@ -419,6 +528,7 @@ class Orchestrator:
                     "dedicated": session.dedicated_runtime,
                     "port": session.runtime_port,
                     "process": session.runtime_process,
+                    "venv": session.venv,
                 }
             } if session.runtime_url else {},
         }

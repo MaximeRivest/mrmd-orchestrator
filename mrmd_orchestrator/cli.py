@@ -21,7 +21,7 @@ import signal
 import sys
 from pathlib import Path
 
-from .config import OrchestratorConfig, SyncConfig, RuntimeConfig, MonitorConfig, EditorConfig
+from .config import OrchestratorConfig, SyncConfig, RuntimeConfig, MonitorConfig, EditorConfig, AiConfig
 from .orchestrator import Orchestrator
 from .server import run_server
 
@@ -88,6 +88,12 @@ Monitors are started on-demand via the API:
         default=8000,
         help="HTTP port for Python runtime (default: 8000)",
     )
+    parser.add_argument(
+        "--ai-port",
+        type=int,
+        default=51790,
+        help="HTTP port for AI server (default: 51790)",
+    )
 
     # Remote services
     parser.add_argument(
@@ -97,6 +103,10 @@ Monitors are started on-demand via the API:
     parser.add_argument(
         "--runtime-url",
         help="Connect to existing Python runtime instead of starting one",
+    )
+    parser.add_argument(
+        "--ai-url",
+        help="Connect to existing AI server instead of starting one",
     )
 
     # Disable services
@@ -119,6 +129,20 @@ Monitors are started on-demand via the API:
         "--no-monitors",
         action="store_true",
         help="Don't allow starting monitors",
+    )
+    parser.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="Don't start AI server",
+    )
+
+    # AI options
+    parser.add_argument(
+        "--juice-level", "-j",
+        type=int,
+        default=0,
+        choices=[0, 1, 2, 3, 4],
+        help="Default AI juice level: 0=Quick, 1=Balanced, 2=Deep, 3=Maximum, 4=Ultimate (default: 0)",
     )
 
     # Auto-start monitors
@@ -216,6 +240,27 @@ def build_config(args) -> OrchestratorConfig:
         port=args.port,
     )
 
+    # AI config
+    if args.ai_url:
+        config.ai = AiConfig(
+            managed=False,
+            url=args.ai_url,
+            default_juice_level=args.juice_level,
+        )
+    elif args.no_ai:
+        config.ai = AiConfig(
+            managed=False,
+            url=f"http://localhost:{args.ai_port}",
+            default_juice_level=args.juice_level,
+        )
+    else:
+        config.ai = AiConfig(
+            managed=True,
+            url=f"http://localhost:{args.ai_port}",
+            port=args.ai_port,
+            default_juice_level=args.juice_level,
+        )
+
     # Log level
     config.log_level = args.log_level
 
@@ -278,12 +323,15 @@ async def async_main(args):
         # Print status
         urls = orchestrator.get_urls()
         sessions = orchestrator.get_sessions()
+        juice_names = ["Quick", "Balanced", "Deep", "Maximum", "Ultimate"]
         print()
         print("\033[36m  mrmd orchestrator\033[0m")
         print("  " + "─" * 40)
         print(f"  Editor:   http://localhost:{config.editor.port}")
         print(f"  Sync:     {urls['sync']}")
         print(f"  Runtime:  {urls['runtimes'].get('python', 'not running')} (shared)")
+        if urls.get('ai'):
+            print(f"  AI:       {urls['ai']} (juice={juice_names[config.ai.default_juice_level]})")
         print(f"  API:      http://localhost:{config.editor.port}/api/status")
 
         # Show active sessions

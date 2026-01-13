@@ -82,6 +82,26 @@ class EditorConfig:
 
 
 @dataclass
+class AiConfig:
+    """Configuration for mrmd-ai server."""
+
+    # If True, orchestrator starts mrmd-ai. If False, connects to existing.
+    managed: bool = True
+
+    # HTTP URL for the AI server
+    url: str = "http://localhost:51790"
+
+    # Port to run on (when managed=True)
+    port: int = 51790
+
+    # Default juice level (0-4)
+    default_juice_level: int = 0
+
+    # Path to mrmd-ai package (auto-detected if None)
+    package_path: Optional[str] = None
+
+
+@dataclass
 class OrchestratorConfig:
     """Main configuration for the orchestrator."""
 
@@ -102,6 +122,9 @@ class OrchestratorConfig:
     # Editor config
     editor: EditorConfig = field(default_factory=EditorConfig)
 
+    # AI server config
+    ai: AiConfig = field(default_factory=AiConfig)
+
     # Log level
     log_level: str = "info"
 
@@ -121,6 +144,9 @@ class OrchestratorConfig:
 
         if self.editor.package_path is None:
             self.editor.package_path = str(packages / "mrmd-editor")
+
+        if self.ai.package_path is None:
+            self.ai.package_path = str(packages / "mrmd-ai")
 
         for runtime in self.runtimes.values():
             if runtime.package_path is None:

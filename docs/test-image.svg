@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150" viewBox="0 0 200 150">
+  <rect width="200" height="150" fill="#4f46e5"/>
+  <text x="100" y="75" text-anchor="middle" fill="white" font-family="sans-serif" font-size="16" dy=".3em">Test Image</text>
+  <text x="100" y="100" text-anchor="middle" fill="#a5b4fc" font-family="sans-serif" font-size="12" dy=".3em">Local SVG</text>
+</svg>

@@ -5,15 +5,23 @@ Provides:
 - API for starting/stopping monitors
 - Status endpoints
 - Static file serving for mrmd-editor
+- File management (browse, rename, copy)
+- Environment management (venv, cwd)
 """
 
 import asyncio
 import logging
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+import httpx
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -39,6 +47,7 @@ class SessionRequest(BaseModel):
     """Request to create a session."""
     doc: str
     python: str = "shared"  # "shared" or "dedicated"
+    venv: Optional[str] = None  # Path to virtual environment for dedicated runtimes
 
 
 class SessionResponse(BaseModel):
@@ -49,6 +58,67 @@ class SessionResponse(BaseModel):
     runtimes: dict
 
 
+# --- File Management Models ---
+
+class FileEntry(BaseModel):
+    """A file or directory entry."""
+    name: str
+    path: str  # Relative path from docs root
+    type: str  # 'file' or 'directory'
+    size: Optional[int] = None
+    modified: Optional[float] = None
+
+
+class FileListResponse(BaseModel):
+    """Response for file listing."""
+    files: List[FileEntry]
+    path: str  # Current path being listed
+    root: str  # Docs root directory
+
+
+class RenameRequest(BaseModel):
+    """Request to rename a file."""
+    from_path: str  # Current filename (relative to docs)
+    to_path: str  # New filename (relative to docs)
+
+
+class CopyRequest(BaseModel):
+    """Request to copy a file."""
+    from_path: str  # Source file (relative to docs)
+    to_path: str  # Destination (can be absolute or relative)
+
+
+class BrowseResponse(BaseModel):
+    """Response for filesystem browsing."""
+    entries: List[FileEntry]
+    path: str  # Current path
+    parent: Optional[str] = None  # Parent path (None if at root)
+
+
+# --- Environment Models ---
+
+class PythonEnvironment(BaseModel):
+    """Python environment information."""
+    version: str
+    executable: str
+    venv: Optional[str] = None
+    venv_name: Optional[str] = None
+    cwd: str
+    status: str  # 'ready', 'starting', 'stopped', 'error'
+
+
+class EnvironmentResponse(BaseModel):
+    """Response for environment info."""
+    python: Optional[PythonEnvironment] = None
+    project_root: str
+
+
+class EnvironmentUpdateRequest(BaseModel):
+    """Request to update environment."""
+    venv: Optional[str] = None  # Path to venv (or None to use system Python)
+    cwd: Optional[str] = None  # Working directory
+
+
 def create_app(orchestrator: Orchestrator) -> FastAPI:
     """Create FastAPI application with orchestrator endpoints."""
 
@@ -56,6 +126,15 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         title="mrmd-orchestrator",
         description="Orchestrator for mrmd services",
         version="0.1.0",
+    )
+
+    # Add CORS middleware for browser access
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     # Store orchestrator reference
@@ -161,24 +240,69 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
 
     # --- File Management ---
 
-    @app.get("/api/files")
-    async def list_files():
-        """List markdown files in the docs directory."""
-        docs_dir = Path(orchestrator.config.sync.docs_dir)
-        if not docs_dir.exists():
-            return {"files": []}
+    def _list_directory(base_dir: Path, rel_path: str = "", recursive: bool = False) -> List[FileEntry]:
+        """List files and directories in a path."""
+        target_dir = base_dir / rel_path if rel_path else base_dir
+        if not target_dir.exists():
+            return []
 
-        files = []
-        for f in sorted(docs_dir.glob("*.md")):
-            if f.is_file():
-                stat = f.stat()
-                files.append({
-                    "name": f.stem,  # filename without .md
-                    "path": f.name,  # filename with .md
-                    "size": stat.st_size,
-                    "modified": stat.st_mtime,
-                })
-        return {"files": files}
+        entries = []
+        try:
+            for item in sorted(target_dir.iterdir()):
+                # Skip hidden files and .mrmd-sync directory
+                if item.name.startswith('.'):
+                    continue
+
+                rel_item_path = str(item.relative_to(base_dir))
+
+                if item.is_dir():
+                    entry = FileEntry(
+                        name=item.name,
+                        path=rel_item_path,
+                        type="directory"
+                    )
+                    entries.append(entry)
+
+                    # Recursively list subdirectories if requested
+                    if recursive:
+                        entries.extend(_list_directory(base_dir, rel_item_path, recursive=True))
+
+                elif item.is_file() and item.suffix == '.md':
+                    stat = item.stat()
+                    entries.append(FileEntry(
+                        name=item.stem,  # filename without .md
+                        path=rel_item_path,
+                        type="file",
+                        size=stat.st_size,
+                        modified=stat.st_mtime
+                    ))
+        except PermissionError:
+            pass
+
+        return entries
+
+    @app.get("/api/files")
+    async def list_files(
+        path: str = Query("", description="Subdirectory to list"),
+        recursive: bool = Query(False, description="List recursively")
+    ):
+        """
+        List markdown files in the docs directory.
+
+        Query params:
+            path: Subdirectory to list (relative to docs root)
+            recursive: If true, list all files recursively
+        """
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+        if not docs_dir.exists():
+            return FileListResponse(files=[], path=path, root=str(docs_dir))
+
+        files = _list_directory(docs_dir, path, recursive=recursive)
+        return FileListResponse(
+            files=files,
+            path=path,
+            root=str(docs_dir)
+        )
 
     @app.post("/api/files")
     async def create_file(request: dict):
@@ -187,38 +311,348 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         if not name:
             raise HTTPException(status_code=400, detail="Name is required")
 
-        # Sanitize filename
-        safe_name = "".join(c for c in name if c.isalnum() or c in "-_").strip()
-        if not safe_name:
+        # Sanitize filename (allow subdirectories with /)
+        parts = name.split('/')
+        safe_parts = []
+        for part in parts:
+            safe_part = "".join(c for c in part if c.isalnum() or c in "-_. ").strip()
+            if safe_part:
+                safe_parts.append(safe_part)
+
+        if not safe_parts:
             raise HTTPException(status_code=400, detail="Invalid filename")
+
+        safe_name = "/".join(safe_parts)
 
         docs_dir = Path(orchestrator.config.sync.docs_dir)
         docs_dir.mkdir(parents=True, exist_ok=True)
 
-        file_path = docs_dir / f"{safe_name}.md"
+        # Ensure the filename ends with .md
+        if not safe_name.endswith('.md'):
+            file_path = docs_dir / f"{safe_name}.md"
+        else:
+            file_path = docs_dir / safe_name
+            safe_name = safe_name[:-3]  # Remove .md for display name
+
+        # Create parent directories if needed
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
         if file_path.exists():
             raise HTTPException(status_code=409, detail=f"File '{safe_name}' already exists")
 
         # Create with default content
-        content = request.get("content", f"# {name}\n\nStart writing...\n")
+        display_name = safe_parts[-1] if safe_parts else name
+        content = request.get("content", f"# {display_name}\n\nStart writing...\n")
         file_path.write_text(content)
 
-        return {"name": safe_name, "path": f"{safe_name}.md"}
+        return {"name": safe_name, "path": str(file_path.relative_to(docs_dir))}
 
-    @app.delete("/api/files/{name}")
-    async def delete_file(name: str):
+    @app.post("/api/files/rename")
+    async def rename_file(request: RenameRequest):
+        """
+        Rename a markdown file.
+
+        Both paths are relative to docs root.
+        """
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+
+        from_path = docs_dir / request.from_path
+        to_path = docs_dir / request.to_path
+
+        # Ensure .md extension
+        if not to_path.suffix == '.md':
+            to_path = to_path.with_suffix('.md')
+
+        # Security: ensure both paths are within docs_dir
+        try:
+            from_path.resolve().relative_to(docs_dir)
+            to_path.resolve().relative_to(docs_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Path must be within docs directory")
+
+        if not from_path.exists():
+            raise HTTPException(status_code=404, detail=f"File not found: {request.from_path}")
+
+        if to_path.exists():
+            raise HTTPException(status_code=409, detail=f"File already exists: {request.to_path}")
+
+        # Create parent directories if needed
+        to_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Rename the file
+        from_path.rename(to_path)
+
+        # Update session if exists (rename in monitors, etc.)
+        old_name = from_path.stem
+        new_name = to_path.stem
+        if old_name in orchestrator._sessions:
+            # For now, just destroy old session - user can recreate
+            await orchestrator.destroy_session(old_name)
+
+        return {
+            "success": True,
+            "from_path": request.from_path,
+            "to_path": str(to_path.relative_to(docs_dir))
+        }
+
+    @app.post("/api/files/copy")
+    async def copy_file(request: CopyRequest):
+        """
+        Copy a file (Save As functionality).
+
+        from_path is relative to docs root.
+        to_path can be:
+            - Relative to docs root (stays in project, synced)
+            - Absolute path (outside project, not synced)
+        """
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+        from_path = docs_dir / request.from_path
+
+        if not from_path.exists():
+            raise HTTPException(status_code=404, detail=f"File not found: {request.from_path}")
+
+        # Determine if to_path is absolute or relative
+        to_path_str = request.to_path
+        if os.path.isabs(to_path_str):
+            to_path = Path(to_path_str)
+            is_in_project = False
+            try:
+                to_path.resolve().relative_to(docs_dir)
+                is_in_project = True
+            except ValueError:
+                pass
+        else:
+            to_path = docs_dir / to_path_str
+            is_in_project = True
+
+        # Ensure .md extension
+        if not to_path.suffix == '.md':
+            to_path = to_path.with_suffix('.md')
+
+        if to_path.exists():
+            raise HTTPException(status_code=409, detail=f"File already exists: {to_path}")
+
+        # Create parent directories if needed
+        to_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Copy the file
+        shutil.copy2(from_path, to_path)
+
+        return {
+            "success": True,
+            "from_path": request.from_path,
+            "to_path": str(to_path),
+            "in_project": is_in_project,
+            "synced": is_in_project
+        }
+
+    @app.delete("/api/files/{path:path}")
+    async def delete_file(path: str):
         """Delete a markdown file."""
-        docs_dir = Path(orchestrator.config.sync.docs_dir)
-        file_path = docs_dir / f"{name}.md"
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+
+        # Handle both with and without .md extension
+        if not path.endswith('.md'):
+            file_path = docs_dir / f"{path}.md"
+        else:
+            file_path = docs_dir / path
+
+        # Security: ensure path is within docs_dir
+        try:
+            file_path.resolve().relative_to(docs_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Path must be within docs directory")
 
         if not file_path.exists():
-            raise HTTPException(status_code=404, detail=f"File '{name}' not found")
+            raise HTTPException(status_code=404, detail=f"File not found: {path}")
 
         # Also destroy session if exists
+        name = file_path.stem
         await orchestrator.destroy_session(name)
 
         file_path.unlink()
-        return {"status": "deleted", "name": name}
+        return {"status": "deleted", "path": path}
+
+    # --- Filesystem Browsing (for pickers) ---
+
+    @app.get("/api/browse")
+    async def browse_filesystem(
+        path: str = Query("~", description="Directory to browse"),
+        type: str = Query("all", description="Filter: 'all', 'dir', 'file'"),
+        show_hidden: bool = Query(False, description="Show hidden files")
+    ):
+        """
+        Browse the filesystem for file/folder pickers.
+
+        This allows browsing outside the project for selecting venvs, etc.
+        """
+        # Expand ~ to home directory
+        browse_path = Path(path).expanduser().resolve()
+
+        if not browse_path.exists():
+            raise HTTPException(status_code=404, detail=f"Path not found: {path}")
+
+        if not browse_path.is_dir():
+            raise HTTPException(status_code=400, detail=f"Not a directory: {path}")
+
+        entries = []
+        try:
+            for item in sorted(browse_path.iterdir()):
+                # Skip hidden files unless requested
+                if not show_hidden and item.name.startswith('.'):
+                    continue
+
+                # Filter by type
+                if type == "dir" and not item.is_dir():
+                    continue
+                if type == "file" and not item.is_file():
+                    continue
+
+                entry_type = "directory" if item.is_dir() else "file"
+
+                try:
+                    stat = item.stat()
+                    entries.append(FileEntry(
+                        name=item.name,
+                        path=str(item),
+                        type=entry_type,
+                        size=stat.st_size if item.is_file() else None,
+                        modified=stat.st_mtime
+                    ))
+                except (PermissionError, OSError):
+                    # Skip files we can't access
+                    entries.append(FileEntry(
+                        name=item.name,
+                        path=str(item),
+                        type=entry_type
+                    ))
+
+        except PermissionError:
+            raise HTTPException(status_code=403, detail=f"Permission denied: {path}")
+
+        # Calculate parent path
+        parent = str(browse_path.parent) if browse_path.parent != browse_path else None
+
+        return BrowseResponse(
+            entries=entries,
+            path=str(browse_path),
+            parent=parent
+        )
+
+    # --- Environment Management ---
+
+    def _get_python_info() -> Optional[PythonEnvironment]:
+        """Get information about the current Python runtime."""
+        python_config = orchestrator.config.runtimes.get("python")
+        if not python_config:
+            return None
+
+        # Check if runtime is running
+        is_running = orchestrator.processes.is_running("mrmd-python")
+        status = "ready" if is_running else "stopped"
+
+        # Get venv and cwd from orchestrator's environment config
+        env_config = getattr(orchestrator, '_environment', {})
+        venv_path = env_config.get('venv')
+        cwd = env_config.get('cwd', orchestrator.config.sync.docs_dir)
+
+        # Determine Python executable
+        if venv_path:
+            venv_path = Path(venv_path).expanduser().resolve()
+            if sys.platform == 'win32':
+                executable = str(venv_path / 'Scripts' / 'python.exe')
+            else:
+                executable = str(venv_path / 'bin' / 'python')
+            venv_name = venv_path.name
+        else:
+            executable = sys.executable
+            venv_name = None
+
+        # Get Python version
+        try:
+            if venv_path and Path(executable).exists():
+                result = subprocess.run(
+                    [executable, '--version'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                version = result.stdout.strip().replace('Python ', '')
+            else:
+                version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        except Exception:
+            version = "unknown"
+
+        return PythonEnvironment(
+            version=version,
+            executable=executable,
+            venv=str(venv_path) if venv_path else None,
+            venv_name=venv_name,
+            cwd=str(Path(cwd).resolve()),
+            status=status
+        )
+
+    @app.get("/api/environment")
+    async def get_environment():
+        """Get current environment configuration."""
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+
+        return EnvironmentResponse(
+            python=_get_python_info(),
+            project_root=str(docs_dir.parent)  # Assume project root is parent of docs
+        )
+
+    @app.post("/api/environment")
+    async def update_environment(request: EnvironmentUpdateRequest):
+        """
+        Update environment configuration for the SHARED runtime.
+
+        NOTE: To change venv, use POST /api/sessions with a venv parameter
+        to create a dedicated runtime for the document.
+
+        This endpoint only supports changing cwd for the shared runtime.
+        """
+        # Store environment config on orchestrator
+        if not hasattr(orchestrator, '_environment'):
+            orchestrator._environment = {}
+
+        changes = []
+
+        # NOTE: venv changes are no longer supported via this endpoint.
+        # Use POST /api/sessions with venv parameter for dedicated runtimes.
+        if request.venv is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Venv changes are not supported for the shared runtime. Use POST /api/sessions with venv parameter to create a dedicated runtime."
+            )
+
+        if request.cwd is not None:
+            cwd_path = Path(request.cwd).expanduser().resolve()
+            if not cwd_path.exists():
+                raise HTTPException(status_code=400, detail=f"Directory not found: {request.cwd}")
+            if not cwd_path.is_dir():
+                raise HTTPException(status_code=400, detail=f"Not a directory: {request.cwd}")
+
+            orchestrator._environment['cwd'] = str(cwd_path)
+            changes.append('cwd')
+
+        # Restart Python runtime with new config if changes were made
+        if changes and orchestrator.processes.is_running("mrmd-python"):
+            logger.info(f"Restarting Python runtime with new environment: {changes}")
+
+            # Stop current runtime
+            await orchestrator.processes.stop("mrmd-python")
+
+            # Start with new settings
+            python_config = orchestrator.config.runtimes.get("python")
+            if python_config:
+                await orchestrator._start_python_runtime_with_env(python_config)
+
+        return {
+            "success": True,
+            "changes": changes,
+            "environment": _get_python_info().model_dump() if _get_python_info() else None
+        }
 
     # --- Session Management ---
 
@@ -242,11 +676,13 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         Request body:
             doc: Document name (Yjs room name)
             python: "shared" (default) or "dedicated"
+            venv: Optional path to virtual environment for dedicated runtimes
 
         Returns session info with URLs for sync, monitor, and runtime.
         """
         doc = request.doc
         python = request.python
+        venv = request.venv
 
         if python not in ("shared", "dedicated"):
             raise HTTPException(
@@ -255,7 +691,7 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
             )
 
         try:
-            await orchestrator.create_session(doc, python=python)
+            await orchestrator.create_session(doc, python=python, venv=venv)
             info = orchestrator.get_session_info(doc)
 
             if not info:
@@ -298,6 +734,130 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
                 status_code=500,
                 detail=f"Failed to destroy session for '{doc}'"
             )
+
+    # --- AI Server Proxy ---
+
+    @app.get("/api/ai/status")
+    async def ai_status():
+        """Get AI server status."""
+        ai_config = orchestrator.config.ai
+        return {
+            "url": ai_config.url,
+            "managed": ai_config.managed,
+            "running": orchestrator.processes.is_running("mrmd-ai"),
+            "default_juice_level": ai_config.default_juice_level,
+        }
+
+    @app.get("/api/ai/programs")
+    async def ai_programs():
+        """Get list of available AI programs."""
+        ai_url = orchestrator.config.ai.url
+        if not ai_url:
+            raise HTTPException(status_code=503, detail="AI server not configured")
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{ai_url}/programs", timeout=5.0)
+                response.raise_for_status()
+                return response.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=503, detail=f"AI server unavailable: {e}")
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+
+    @app.post("/api/ai/{program}")
+    async def ai_execute(program: str, request: Request):
+        """
+        Execute an AI program.
+
+        Proxies request to AI server with optional X-Juice-Level header.
+        """
+        ai_url = orchestrator.config.ai.url
+        if not ai_url:
+            raise HTTPException(status_code=503, detail="AI server not configured")
+
+        # Get request body
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        # Get juice level from header or use default
+        juice_level = request.headers.get("X-Juice-Level")
+        if juice_level is None:
+            juice_level = str(orchestrator.config.ai.default_juice_level)
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{ai_url}/{program}",
+                    json=body,
+                    headers={"X-Juice-Level": juice_level},
+                    timeout=120.0,  # AI requests can be slow
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=503, detail=f"AI server unavailable: {e}")
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+
+    @app.post("/api/ai/{program}/stream")
+    async def ai_execute_stream(program: str, request: Request):
+        """
+        Execute an AI program with Server-Sent Events streaming.
+
+        Returns SSE stream with progress events.
+        """
+        ai_url = orchestrator.config.ai.url
+        if not ai_url:
+            raise HTTPException(status_code=503, detail="AI server not configured")
+
+        # Get request body
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        # Get juice level from header or use default
+        juice_level = request.headers.get("X-Juice-Level")
+        if juice_level is None:
+            juice_level = str(orchestrator.config.ai.default_juice_level)
+
+        async def event_generator():
+            """Stream SSE events from AI server."""
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        f"{ai_url}/{program}/stream",
+                        json=body,
+                        headers={
+                            "X-Juice-Level": juice_level,
+                            "Accept": "text/event-stream",
+                        },
+                        timeout=300.0,  # Longer timeout for streaming
+                    ) as response:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            if line:
+                                yield line + "\n"
+                            else:
+                                yield "\n"
+            except httpx.RequestError as e:
+                yield f"event: error\ndata: {{\"error\": \"AI server unavailable: {e}\"}}\n\n"
+            except httpx.HTTPStatusError as e:
+                yield f"event: error\ndata: {{\"error\": \"HTTP {e.response.status_code}: {e}\"}}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
 
     return app
 
