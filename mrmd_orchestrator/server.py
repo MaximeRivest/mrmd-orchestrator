@@ -27,6 +27,12 @@ from pydantic import BaseModel
 
 from .orchestrator import Orchestrator
 from .config import OrchestratorConfig
+from .context import (
+    DEFAULT_CONTEXT_TEMPLATE,
+    context_path_default,
+    context_path_for_doc,
+    resolve_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +123,23 @@ class EnvironmentUpdateRequest(BaseModel):
     """Request to update environment."""
     venv: Optional[str] = None  # Path to venv (or None to use system Python)
     cwd: Optional[str] = None  # Working directory
+
+
+# --- Context Models ---
+
+class ContextResolveRequest(BaseModel):
+    """Request to resolve document context for AI."""
+    doc: str
+    content: Optional[str] = None
+    cursorPos: Optional[int] = None
+    selection: Optional[dict] = None
+    codeSymbols: Optional[List[str]] = None
+    ensureExists: bool = False
+
+
+class ContextUpdateRequest(BaseModel):
+    """Request to update a context markdown file."""
+    content: str
 
 
 def create_app(orchestrator: Orchestrator) -> FastAPI:
@@ -249,8 +272,8 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         entries = []
         try:
             for item in sorted(target_dir.iterdir()):
-                # Skip hidden files and .mrmd-sync directory
-                if item.name.startswith('.'):
+                # Skip hidden/system directories and underscore-prefixed infrastructure
+                if item.name.startswith('.') or item.name.startswith('_'):
                     continue
 
                 rel_item_path = str(item.relative_to(base_dir))
@@ -734,6 +757,104 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
                 status_code=500,
                 detail=f"Failed to destroy session for '{doc}'"
             )
+
+    # --- Context Management ---
+
+    @app.post("/api/context/resolve")
+    async def resolve_ai_context(request: ContextResolveRequest):
+        """Resolve markdown-managed AI context for a document."""
+        try:
+            return await resolve_context(
+                orchestrator,
+                request.doc,
+                current_content=request.content,
+                cursor_pos=request.cursorPos,
+                selection=request.selection,
+                code_symbols=request.codeSymbols,
+                ensure_exists=request.ensureExists,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.exception("Failed to resolve context for %s", request.doc)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/context")
+    async def get_default_context():
+        """Read project default context markdown."""
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+        path = context_path_default(docs_dir)
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            source = "default"
+            exists = True
+        else:
+            content = DEFAULT_CONTEXT_TEMPLATE
+            source = "builtin"
+            exists = False
+        return {
+            "path": str(path.relative_to(docs_dir)),
+            "content": content,
+            "exists": exists,
+            "source": source,
+        }
+
+    @app.put("/api/context")
+    async def put_default_context(request: ContextUpdateRequest):
+        """Write project default context markdown."""
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+        path = context_path_default(docs_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(request.content, encoding="utf-8")
+        return {"success": True, "path": str(path.relative_to(docs_dir))}
+
+    @app.post("/api/context/init/{doc:path}")
+    async def init_doc_context(doc: str):
+        """Initialize a document-specific context file if missing."""
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+        path = context_path_for_doc(docs_dir, doc)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(DEFAULT_CONTEXT_TEMPLATE, encoding="utf-8")
+        return {"success": True, "doc": doc, "path": str(path.relative_to(docs_dir))}
+
+    @app.get("/api/context/{doc:path}")
+    async def get_doc_context(doc: str):
+        """Read a document-specific context markdown file."""
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+        path = context_path_for_doc(docs_dir, doc)
+        default_path = context_path_default(docs_dir)
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            source = "document"
+            exists = True
+            actual_path = path
+        elif default_path.exists():
+            content = default_path.read_text(encoding="utf-8")
+            source = "default"
+            exists = False
+            actual_path = default_path
+        else:
+            content = DEFAULT_CONTEXT_TEMPLATE
+            source = "builtin"
+            exists = False
+            actual_path = path
+        return {
+            "doc": doc,
+            "path": str(actual_path.relative_to(docs_dir)),
+            "content": content,
+            "exists": exists,
+            "source": source,
+        }
+
+    @app.put("/api/context/{doc:path}")
+    async def put_doc_context(doc: str, request: ContextUpdateRequest):
+        """Write a document-specific context markdown file."""
+        docs_dir = Path(orchestrator.config.sync.docs_dir).resolve()
+        path = context_path_for_doc(docs_dir, doc)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(request.content, encoding="utf-8")
+        return {"success": True, "doc": doc, "path": str(path.relative_to(docs_dir))}
 
     # --- AI Server Proxy ---
 
